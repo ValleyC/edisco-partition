@@ -827,7 +827,9 @@ class PartitionLoss(nn.Module):
         # 5. Supervised Loss (if ground truth available)
         if gt_clusters is not None:
             gt_customers = gt_clusters[:, 1:]  # Exclude depot
-            valid_mask = gt_customers >= 0  # -1 indicates no assignment
+            n_classes = cluster_logits.size(-1)  # Number of clusters
+            # Valid mask: assigned (>=0) AND within valid cluster range (<n_classes)
+            valid_mask = (gt_customers >= 0) & (gt_customers < n_classes)
 
             if valid_mask.any():
                 supervised_loss = F.cross_entropy(
