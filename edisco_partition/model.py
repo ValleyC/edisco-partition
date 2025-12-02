@@ -228,7 +228,7 @@ class EGNNLayer(nn.Module):
             attn_logits = attn_logits / math.sqrt(self.head_dim)
 
             if mask is not None:
-                attn_logits = attn_logits.masked_fill(mask.unsqueeze(-1) == 0, -1e9)
+                attn_logits = attn_logits.masked_fill(mask.unsqueeze(-1) == 0, -1e4)
 
             attn_weights = F.softmax(attn_logits, dim=2)  # (batch, n, n, n_heads)
 
@@ -463,8 +463,9 @@ class CapacityAwareClusterHead(nn.Module):
         cluster_logits = cluster_logits + 0.1 * self.capacity_refine(refine_input)
 
         # Depot masking (depot doesn't belong to any cluster)
+        # Use -1e4 instead of -1e9 to avoid FP16 overflow in mixed precision
         depot_mask = torch.zeros_like(cluster_logits)
-        depot_mask[:, 0, :] = -1e9
+        depot_mask[:, 0, :] = -1e4
         cluster_logits = cluster_logits + depot_mask
 
         # Compute pairwise affinity for spatial coherence loss
