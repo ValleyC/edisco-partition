@@ -855,12 +855,9 @@ class ReinforceLoss(nn.Module):
     This is similar to GLOP's training approach.
     """
 
-    def __init__(self, config: PartitionConfig, baseline_momentum: float = 0.99):
+    def __init__(self, config: PartitionConfig):
         super().__init__()
         self.config = config
-        self.baseline_momentum = baseline_momentum
-        self.register_buffer('baseline', torch.tensor(0.0))
-        self.baseline_initialized = False
 
     def forward(
         self,
@@ -939,23 +936,17 @@ class ReinforceLoss(nn.Module):
         distances = torch.stack(all_distances, dim=1)  # (batch, n_samples)
         log_probs_stacked = torch.stack(all_log_probs, dim=1)  # (batch, n_samples)
 
-        # Compute baseline (exponential moving average)
-        mean_distance = distances.mean()
-        if not self.baseline_initialized:
-            self.baseline = mean_distance.detach()
-            self.baseline_initialized = True
-        else:
-            self.baseline = (
-                self.baseline_momentum * self.baseline +
-                (1 - self.baseline_momentum) * mean_distance.detach()
-            )
+        # Baseline: batch mean (following GLOP exactly)
+        baseline = distances.mean().detach()
 
-        # REINFORCE loss: (distance - baseline) * (-log_prob)
-        advantage = distances - self.baseline
-        reinforce_loss = (advantage * (-log_probs_stacked)).mean()
+        # REINFORCE loss: (distance - baseline) * log_prob
+        # Following GLOP's formula exactly: torch.sum((objs-baseline) * log_probs.sum(dim=1)) / bs
+        # Note: NO negative sign on log_prob!
+        advantage = distances - baseline
+        reinforce_loss = (advantage * log_probs_stacked).sum() / (batch_size * n_samples)
 
-        loss_dict['distance'] = mean_distance.item()
-        loss_dict['baseline'] = self.baseline.item()
+        loss_dict['distance'] = distances.mean().item()
+        loss_dict['baseline'] = baseline.item()
         loss_dict['advantage'] = advantage.mean().item()
         loss_dict['total'] = reinforce_loss.item()
 
