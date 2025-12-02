@@ -57,6 +57,7 @@ from edisco_partition import (
     generate_cvrp_dataset,
     DistributionType
 )
+from edisco_partition.model import ReinforceLoss
 
 
 # ============================================================================
@@ -83,7 +84,11 @@ class TrainingConfig:
     n_heads: int = 8
     dropout: float = 0.1
 
-    # Loss weights
+    # Loss configuration
+    loss_type: str = "reinforce"  # 'reinforce' (direct) or 'multi' (multiple components)
+    n_samples: int = 1  # Number of samples for REINFORCE variance reduction
+
+    # Loss weights (only used for 'multi' loss type)
     balance_weight: float = 1.0
     compactness_weight: float = 0.5
     entropy_weight: float = 0.1
@@ -318,7 +323,13 @@ class PartitionTrainer:
             supervised_weight=config.supervised_weight,
             coverage_weight=config.coverage_weight
         )
-        self.loss_fn = PartitionLoss(partition_config)
+
+        if config.loss_type == 'reinforce':
+            self.loss_fn = ReinforceLoss(partition_config)
+            print("Using REINFORCE loss (direct distance optimization)")
+        else:
+            self.loss_fn = PartitionLoss(partition_config)
+            print("Using multi-component loss")
 
         # Logger
         self.logger = TrainingLogger(config)
@@ -471,9 +482,17 @@ class PartitionTrainer:
             # Forward pass with mixed precision
             with autocast(enabled=self.config.use_amp):
                 outputs = self.model(coords, demands, capacity)
-                loss, loss_dict = self.loss_fn(
-                    outputs, coords, demands, capacity, gt_clusters
-                )
+
+                # Different loss interfaces
+                if self.config.loss_type == 'reinforce':
+                    loss, loss_dict = self.loss_fn(
+                        outputs, coords, demands, capacity,
+                        n_samples=self.config.n_samples
+                    )
+                else:
+                    loss, loss_dict = self.loss_fn(
+                        outputs, coords, demands, capacity, gt_clusters
+                    )
 
                 # Scale for gradient accumulation
                 loss = loss / self.config.grad_accumulation
@@ -508,7 +527,13 @@ class PartitionTrainer:
             n_batches += 1
 
             # Update progress bar
-            pbar.set_postfix({'loss': total_loss / n_batches})
+            if self.config.loss_type == 'reinforce' and 'distance' in loss_dict:
+                pbar.set_postfix({
+                    'dist': loss_dict.get('distance', 0),
+                    'baseline': loss_dict.get('baseline', 0)
+                })
+            else:
+                pbar.set_postfix({'loss': total_loss / n_batches})
 
         # Average metrics
         avg_loss = total_loss / n_batches
@@ -544,9 +569,16 @@ class PartitionTrainer:
 
             # Forward pass
             outputs = self.model(coords, demands, capacity)
-            loss, loss_dict = self.loss_fn(
-                outputs, coords, demands, capacity, gt_clusters
-            )
+
+            # Different loss interfaces
+            if self.config.loss_type == 'reinforce':
+                loss, loss_dict = self.loss_fn(
+                    outputs, coords, demands, capacity, greedy=True
+                )
+            else:
+                loss, loss_dict = self.loss_fn(
+                    outputs, coords, demands, capacity, gt_clusters
+                )
 
             total_loss += loss.item()
             for k, v in loss_dict.items():
@@ -857,6 +889,13 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--grad_clip', type=float, default=1.0)
 
+    # Loss
+    parser.add_argument('--loss_type', type=str, default='reinforce',
+                       choices=['reinforce', 'multi'],
+                       help='Loss type: reinforce (direct distance) or multi (weighted components)')
+    parser.add_argument('--n_samples', type=int, default=1,
+                       help='Number of samples for REINFORCE variance reduction')
+
     # Other
     parser.add_argument('--save_dir', type=str, default='./checkpoints/partition')
     parser.add_argument('--log_dir', type=str, default='./logs/partition')
@@ -885,6 +924,8 @@ def main():
             batch_size=args.batch_size,
             learning_rate=args.lr,
             grad_clip=args.grad_clip,
+            loss_type=args.loss_type,
+            n_samples=args.n_samples,
             save_dir=args.save_dir,
             log_dir=args.log_dir,
             seed=args.seed,

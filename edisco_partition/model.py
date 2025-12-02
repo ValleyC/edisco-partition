@@ -845,6 +845,247 @@ class PartitionLoss(nn.Module):
         return total_loss, loss_dict
 
 
+class ReinforceLoss(nn.Module):
+    """
+    REINFORCE-based loss for partition training.
+
+    Directly optimizes for routing distance using policy gradient:
+        Loss = (distance - baseline) * (-log_prob)
+
+    This is similar to GLOP's training approach.
+    """
+
+    def __init__(self, config: PartitionConfig, baseline_momentum: float = 0.99):
+        super().__init__()
+        self.config = config
+        self.baseline_momentum = baseline_momentum
+        self.register_buffer('baseline', torch.tensor(0.0))
+        self.baseline_initialized = False
+
+    def forward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        coords: torch.Tensor,
+        demands: torch.Tensor,
+        capacity: torch.Tensor,
+        n_samples: int = 1,
+        greedy: bool = False
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute REINFORCE loss.
+
+        Args:
+            outputs: Network outputs with 'cluster_logits'
+            coords: (batch, n_nodes, 2)
+            demands: (batch, n_nodes)
+            capacity: (batch,) or scalar
+            n_samples: Number of samples for variance reduction
+            greedy: If True, use greedy assignment (for evaluation)
+
+        Returns:
+            loss, loss_dict
+        """
+        cluster_logits = outputs['cluster_logits']  # (batch, n_nodes, n_clusters)
+        batch_size, n_nodes, n_clusters = cluster_logits.shape
+
+        # Get logits for customers only (exclude depot)
+        customer_logits = cluster_logits[:, 1:, :]  # (batch, n_customers, n_clusters)
+        n_customers = n_nodes - 1
+
+        # Compute log probabilities
+        log_probs = F.log_softmax(customer_logits, dim=-1)
+        probs = F.softmax(customer_logits, dim=-1)
+
+        if capacity.dim() == 0:
+            capacity = capacity.unsqueeze(0).expand(batch_size)
+        elif capacity.dim() == 1 and capacity.size(0) == 1:
+            capacity = capacity.expand(batch_size)
+
+        loss_dict = {}
+
+        if greedy:
+            # Greedy assignment for evaluation
+            assignments = customer_logits.argmax(dim=-1)  # (batch, n_customers)
+            distances = self._compute_routing_distances(
+                coords, demands, capacity, assignments
+            )
+            loss_dict['distance'] = distances.mean().item()
+            loss_dict['total'] = 0.0
+            return torch.tensor(0.0, device=cluster_logits.device), loss_dict
+
+        # Sample multiple times for variance reduction
+        all_distances = []
+        all_log_probs = []
+
+        for _ in range(n_samples):
+            # Sample cluster assignments
+            dist = torch.distributions.Categorical(probs=probs)
+            assignments = dist.sample()  # (batch, n_customers)
+
+            # Get log probability of sampled assignments
+            sample_log_probs = dist.log_prob(assignments)  # (batch, n_customers)
+            total_log_prob = sample_log_probs.sum(dim=-1)  # (batch,)
+
+            # Compute routing distance for sampled partition
+            with torch.no_grad():
+                distances = self._compute_routing_distances(
+                    coords, demands, capacity, assignments
+                )
+
+            all_distances.append(distances)
+            all_log_probs.append(total_log_prob)
+
+        # Stack samples
+        distances = torch.stack(all_distances, dim=1)  # (batch, n_samples)
+        log_probs_stacked = torch.stack(all_log_probs, dim=1)  # (batch, n_samples)
+
+        # Compute baseline (exponential moving average)
+        mean_distance = distances.mean()
+        if not self.baseline_initialized:
+            self.baseline = mean_distance.detach()
+            self.baseline_initialized = True
+        else:
+            self.baseline = (
+                self.baseline_momentum * self.baseline +
+                (1 - self.baseline_momentum) * mean_distance.detach()
+            )
+
+        # REINFORCE loss: (distance - baseline) * (-log_prob)
+        advantage = distances - self.baseline
+        reinforce_loss = (advantage * (-log_probs_stacked)).mean()
+
+        loss_dict['distance'] = mean_distance.item()
+        loss_dict['baseline'] = self.baseline.item()
+        loss_dict['advantage'] = advantage.mean().item()
+        loss_dict['total'] = reinforce_loss.item()
+
+        return reinforce_loss, loss_dict
+
+    def _compute_routing_distances(
+        self,
+        coords: torch.Tensor,
+        demands: torch.Tensor,
+        capacity: torch.Tensor,
+        assignments: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute total routing distance for given cluster assignments.
+
+        Args:
+            coords: (batch, n_nodes, 2) - includes depot at index 0
+            demands: (batch, n_nodes)
+            capacity: (batch,)
+            assignments: (batch, n_customers) - cluster assignment per customer
+
+        Returns:
+            distances: (batch,) total routing distance
+        """
+        batch_size = coords.size(0)
+        n_clusters = self.config.n_clusters
+
+        distances = torch.zeros(batch_size, device=coords.device)
+
+        for b in range(batch_size):
+            depot = coords[b, 0].cpu().numpy()
+            customer_coords = coords[b, 1:].cpu().numpy()
+            customer_demands = demands[b, 1:].cpu().numpy()
+            cap = capacity[b].item()
+            cluster_assigns = assignments[b].cpu().numpy()
+
+            total_dist = 0.0
+
+            # Process each cluster
+            for k in range(n_clusters):
+                cluster_mask = (cluster_assigns == k)
+                if not cluster_mask.any():
+                    continue
+
+                cluster_indices = np.where(cluster_mask)[0]
+                cluster_coords = customer_coords[cluster_indices]
+                cluster_demands = customer_demands[cluster_indices]
+
+                # Split cluster into capacity-feasible routes
+                routes = self._split_by_capacity(
+                    cluster_indices, cluster_demands, cap
+                )
+
+                # Route each sub-route
+                for route_indices in routes:
+                    if len(route_indices) == 0:
+                        continue
+                    route_coords = customer_coords[route_indices]
+                    route_dist = self._route_nearest_neighbor(depot, route_coords)
+                    total_dist += route_dist
+
+            distances[b] = total_dist
+
+        return distances
+
+    def _split_by_capacity(
+        self,
+        indices: np.ndarray,
+        demands: np.ndarray,
+        capacity: float
+    ) -> List[List[int]]:
+        """Split customers into capacity-feasible groups."""
+        routes = []
+        current_route = []
+        current_load = 0.0
+
+        for idx, demand in zip(indices, demands):
+            if current_load + demand > capacity and current_route:
+                routes.append(current_route)
+                current_route = [idx]
+                current_load = demand
+            else:
+                current_route.append(idx)
+                current_load += demand
+
+        if current_route:
+            routes.append(current_route)
+
+        return routes
+
+    def _route_nearest_neighbor(
+        self,
+        depot: np.ndarray,
+        customer_coords: np.ndarray
+    ) -> float:
+        """Compute route distance using nearest neighbor heuristic."""
+        if len(customer_coords) == 0:
+            return 0.0
+
+        n = len(customer_coords)
+        visited = [False] * n
+        route = []
+
+        # Start from depot, find nearest customer
+        current = depot
+        total_dist = 0.0
+
+        for _ in range(n):
+            best_dist = float('inf')
+            best_idx = -1
+
+            for i in range(n):
+                if not visited[i]:
+                    dist = np.linalg.norm(current - customer_coords[i])
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_idx = i
+
+            if best_idx >= 0:
+                visited[best_idx] = True
+                total_dist += best_dist
+                current = customer_coords[best_idx]
+                route.append(best_idx)
+
+        # Return to depot
+        total_dist += np.linalg.norm(current - depot)
+
+        return total_dist
+
+
 # ============================================================================
 # EQUIVARIANCE VERIFICATION
 # ============================================================================
