@@ -73,6 +73,7 @@ class TrainingConfig:
     test_size: int = 1000
     distribution: str = "uniform"
     data_dir: str = "./data/cvrp_large"
+    solver: str = "heuristic"  # 'heuristic' (fast), 'lkh' (slow but optimal), 'auto'
 
     # Model
     n_clusters: int = 10
@@ -359,39 +360,41 @@ class PartitionTrainer:
         val_path = data_dir / f"cvrp_{self.config.n_customers}_{self.config.distribution}_val.pkl.gz"
         test_path = data_dir / f"cvrp_{self.config.n_customers}_{self.config.distribution}_test.pkl.gz"
 
-        # Generate data if needed
+        # Generate data if needed (use heuristics for speed, LKH for quality)
+        solver = getattr(self.config, 'solver', 'heuristic')  # Default to fast heuristics
+
         if not train_path.exists():
-            print("Generating training data...")
+            print(f"Generating training data (solver={solver})...")
             generate_cvrp_dataset(
                 n_instances=self.config.train_size,
                 n_customers=self.config.n_customers,
                 output_path=str(train_path).replace('.gz', ''),
                 distribution=distribution,
-                solver='auto',
+                solver=solver,
                 time_limit=30,
                 base_seed=self.config.seed
             )
 
         if not val_path.exists():
-            print("Generating validation data...")
+            print(f"Generating validation data (solver={solver})...")
             generate_cvrp_dataset(
                 n_instances=self.config.val_size,
                 n_customers=self.config.n_customers,
                 output_path=str(val_path).replace('.gz', ''),
                 distribution=distribution,
-                solver='auto',
+                solver=solver,
                 time_limit=60,
                 base_seed=self.config.seed + 100000
             )
 
         if not test_path.exists():
-            print("Generating test data...")
+            print(f"Generating test data (solver={solver})...")
             generate_cvrp_dataset(
                 n_instances=self.config.test_size,
                 n_customers=self.config.n_customers,
                 output_path=str(test_path).replace('.gz', ''),
                 distribution=distribution,
-                solver='auto',
+                solver=solver,
                 time_limit=120,
                 base_seed=self.config.seed + 200000
             )
@@ -839,6 +842,9 @@ def main():
     parser.add_argument('--val_size', type=int, default=1000)
     parser.add_argument('--distribution', type=str, default='uniform')
     parser.add_argument('--data_dir', type=str, default='./data/cvrp_large')
+    parser.add_argument('--solver', type=str, default='heuristic',
+                       choices=['heuristic', 'lkh', 'auto'],
+                       help='Solver for ground truth: heuristic (fast), lkh (slow), auto')
 
     # Model
     parser.add_argument('--n_clusters', type=int, default=10)
@@ -871,6 +877,7 @@ def main():
             val_size=args.val_size,
             distribution=args.distribution,
             data_dir=args.data_dir,
+            solver=args.solver,
             n_clusters=args.n_clusters,
             n_layers=args.n_layers,
             hidden_dim=args.hidden_dim,

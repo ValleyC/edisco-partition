@@ -31,7 +31,7 @@ setup(
         "Programming Language :: Python :: 3.11",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
-    python_requires=">=3.8",
+    python_requires=">=3.7",
     install_requires=[
         "torch>=1.12.0",
         "numpy>=1.20.0",

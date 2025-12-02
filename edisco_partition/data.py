@@ -453,11 +453,34 @@ class LKHSolver(CVRPSolver):
 
     def _find_lkh(self) -> Optional[str]:
         """Try to find LKH executable."""
+        import shutil
+
+        # Check environment variable first
+        env_path = os.environ.get('LKH_PATH')
+        if env_path and os.path.isfile(env_path):
+            return env_path
+
+        # Check if LKH is in system PATH
+        system_lkh = shutil.which('LKH')
+        if system_lkh:
+            return system_lkh
+
+        # Common installation paths
+        home = os.path.expanduser("~")
         possible_paths = [
+            # User home paths
+            f"{home}/Code/CVRP/LKH-3.0.8/LKH",
+            f"{home}/Code/CVRP/LKH-3.0.6/LKH",
+            f"{home}/LKH-3/LKH",
+            f"{home}/LKH/LKH",
+            # Relative paths
             "./LKH-3/LKH",
             "./LKH",
             "../LKH-3/LKH",
-            "LKH"  # System PATH
+            "../LKH-3.0.8/LKH",
+            # System paths
+            "/usr/local/bin/LKH",
+            "/opt/LKH-3/LKH",
         ]
         for path in possible_paths:
             if os.path.isfile(path):
