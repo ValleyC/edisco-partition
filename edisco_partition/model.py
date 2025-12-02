@@ -982,8 +982,9 @@ class ReinforceLoss(nn.Module):
         """
         batch_size = coords.size(0)
         n_clusters = self.config.n_clusters
+        device = coords.device
 
-        distances = torch.zeros(batch_size, device=coords.device)
+        dist_list = []
 
         for b in range(batch_size):
             depot = coords[b, 0].cpu().numpy()
@@ -1017,9 +1018,9 @@ class ReinforceLoss(nn.Module):
                     route_dist = self._route_nearest_neighbor(depot, route_coords)
                     total_dist += route_dist
 
-            distances[b] = total_dist
+            dist_list.append(total_dist)
 
-        return distances
+        return torch.tensor(dist_list, device=device, dtype=torch.float32)
 
     def _split_by_capacity(
         self,
