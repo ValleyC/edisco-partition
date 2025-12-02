@@ -936,17 +936,23 @@ class ReinforceLoss(nn.Module):
         distances = torch.stack(all_distances, dim=1)  # (batch, n_samples)
         log_probs_stacked = torch.stack(all_log_probs, dim=1)  # (batch, n_samples)
 
-        # Baseline: batch mean (following GLOP exactly)
-        baseline = distances.mean().detach()
+        # Baseline: per-instance mean (self-critical, following GLOP)
+        # GLOP computes baseline as mean over samples for EACH instance separately
+        # This is crucial - we compare solutions for the SAME problem, not across problems
+        if n_samples > 1:
+            # Per-instance baseline: mean over samples for each instance
+            baseline = distances.mean(dim=1, keepdim=True).detach()  # (batch, 1)
+        else:
+            # With only 1 sample, fall back to batch mean (less effective)
+            baseline = distances.mean().detach()
 
         # REINFORCE loss: (distance - baseline) * log_prob
-        # Following GLOP's formula exactly: torch.sum((objs-baseline) * log_probs.sum(dim=1)) / bs
-        # Note: NO negative sign on log_prob!
+        # Following GLOP: torch.sum((objs-baseline) * log_probs.sum(dim=1)) / bs
         advantage = distances - baseline
         reinforce_loss = (advantage * log_probs_stacked).sum() / (batch_size * n_samples)
 
         loss_dict['distance'] = distances.mean().item()
-        loss_dict['baseline'] = baseline.item()
+        loss_dict['baseline'] = baseline.mean().item() if baseline.numel() > 1 else baseline.item()
         loss_dict['advantage'] = advantage.mean().item()
         loss_dict['total'] = reinforce_loss.item()
 

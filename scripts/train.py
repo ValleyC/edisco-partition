@@ -86,7 +86,7 @@ class TrainingConfig:
 
     # Loss configuration
     loss_type: str = "reinforce"  # 'reinforce' (direct) or 'multi' (multiple components)
-    n_samples: int = 1  # Number of samples for REINFORCE variance reduction
+    n_samples: int = 8  # Number of samples for REINFORCE (GLOP uses 10, need >1 for self-critical baseline)
 
     # Loss weights (only used for 'multi' loss type)
     balance_weight: float = 1.0
@@ -893,8 +893,8 @@ def main():
     parser.add_argument('--loss_type', type=str, default='reinforce',
                        choices=['reinforce', 'multi'],
                        help='Loss type: reinforce (direct distance) or multi (weighted components)')
-    parser.add_argument('--n_samples', type=int, default=1,
-                       help='Number of samples for REINFORCE variance reduction')
+    parser.add_argument('--n_samples', type=int, default=8,
+                       help='Number of samples for REINFORCE (need >1 for self-critical baseline)')
 
     # Other
     parser.add_argument('--save_dir', type=str, default='./checkpoints/partition')
