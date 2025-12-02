@@ -529,11 +529,11 @@ class PartitionTrainer:
             # Update progress bar
             if self.config.loss_type == 'reinforce' and 'distance' in loss_dict:
                 pbar.set_postfix({
-                    'dist': loss_dict.get('distance', 0),
-                    'baseline': loss_dict.get('baseline', 0)
+                    'dist': f"{loss_dict.get('distance', 0):.2f}",
+                    'loss': f"{loss_dict.get('total', 0):.4f}"
                 })
             else:
-                pbar.set_postfix({'loss': total_loss / n_batches})
+                pbar.set_postfix({'loss': f"{total_loss / n_batches:.4f}"})
 
         # Average metrics
         avg_loss = total_loss / n_batches
