@@ -1195,6 +1195,326 @@ def nearest_neighbor_route(coords: np.ndarray, customers: List[int]) -> List[int
 
 
 # ============================================================================
+# HEATMAP-BASED EGNN FOR GLOP-STYLE TRAINING
+# ============================================================================
+
+@dataclass
+class HeatmapConfig:
+    """Configuration for heatmap-based partition network."""
+    # Architecture
+    n_layers: int = 8
+    node_dim: int = 64
+    edge_dim: int = 64
+    hidden_dim: int = 128
+    n_heads: int = 4
+    dropout: float = 0.0
+
+    # Graph construction
+    k_sparse: int = 50  # Number of neighbors per node
+
+    # Training
+    update_coords: bool = True
+
+
+class HeatmapEGNNLayer(nn.Module):
+    """
+    Simplified EGNN layer for heatmap prediction.
+
+    Optimized for producing edge-level outputs (heatmap).
+    """
+
+    def __init__(
+        self,
+        node_dim: int,
+        edge_dim: int,
+        hidden_dim: int,
+        update_coords: bool = True,
+    ):
+        super().__init__()
+        self.node_dim = node_dim
+        self.edge_dim = edge_dim
+        self.hidden_dim = hidden_dim
+        self.update_coords = update_coords
+
+        # Message MLP: [h_i, h_j, d_ij, e_ij] -> message
+        self.msg_mlp = nn.Sequential(
+            nn.Linear(2 * node_dim + 1 + edge_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+
+        # Node update
+        self.node_mlp = nn.Sequential(
+            nn.Linear(node_dim + hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, node_dim),
+        )
+
+        # Edge update
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(edge_dim + hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, edge_dim),
+        )
+
+        # Coordinate update (scalar weights)
+        if update_coords:
+            self.coord_mlp = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.SiLU(),
+                nn.Linear(hidden_dim // 2, 1, bias=False),
+            )
+            nn.init.xavier_uniform_(self.coord_mlp[-1].weight, gain=0.01)
+
+        self.node_norm = nn.LayerNorm(node_dim)
+        self.edge_norm = nn.LayerNorm(edge_dim)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass.
+
+        Args:
+            h: Node features (n_nodes, node_dim)
+            x: Coordinates (n_nodes, 2)
+            edge_index: (2, n_edges)
+            edge_attr: Edge features (n_edges, edge_dim)
+
+        Returns:
+            h_new, x_new, edge_attr_new
+        """
+        src, dst = edge_index
+        n_nodes = h.size(0)
+
+        # Compute distances (INVARIANT)
+        rel_vec = x[dst] - x[src]
+        dist = rel_vec.norm(dim=-1, keepdim=True)
+
+        # Build message input (all INVARIANT)
+        msg_input = torch.cat([h[src], h[dst], dist, edge_attr], dim=-1)
+        msg = self.msg_mlp(msg_input)
+
+        # Aggregate messages
+        agg_msg = torch.zeros(n_nodes, self.hidden_dim, device=h.device, dtype=h.dtype)
+        agg_msg.index_add_(0, dst, msg)
+
+        # Update nodes
+        h_new = h + self.node_mlp(torch.cat([h, agg_msg], dim=-1))
+        h_new = self.node_norm(h_new)
+
+        # Update edges
+        edge_attr_new = edge_attr + self.edge_mlp(torch.cat([edge_attr, msg], dim=-1))
+        edge_attr_new = self.edge_norm(edge_attr_new)
+
+        # Update coordinates (EQUIVARIANT)
+        if self.update_coords:
+            coord_weights = self.coord_mlp(msg)
+            coord_weights = torch.tanh(coord_weights)
+
+            rel_dir = rel_vec / (dist + 1e-8)
+            weighted_vec = coord_weights * rel_dir
+
+            coord_delta = torch.zeros_like(x)
+            coord_delta.index_add_(0, dst, weighted_vec)
+
+            # Normalize by edge count
+            edge_count = torch.zeros(n_nodes, 1, device=x.device, dtype=x.dtype)
+            edge_count.index_add_(0, dst, torch.ones(len(src), 1, device=x.device, dtype=x.dtype))
+            edge_count = edge_count.clamp(min=1)
+
+            x_new = x + coord_delta / edge_count
+        else:
+            x_new = x
+
+        return h_new, x_new, edge_attr_new
+
+
+class HeatmapEGNN(nn.Module):
+    """
+    E(2)-Equivariant network that outputs a heatmap for sequential sampling.
+
+    This network follows GLOP's approach:
+    1. Process graph with EGNN layers
+    2. Output edge-level probabilities (heatmap)
+    3. Used with sequential sampling for REINFORCE training
+
+    The heatmap H[i,j] represents the probability of transitioning from node i to j.
+    """
+
+    def __init__(self, config: HeatmapConfig):
+        super().__init__()
+        self.config = config
+
+        # Input embeddings
+        self.node_embed = nn.Sequential(
+            nn.Linear(2, config.node_dim),  # (demand/cap, dist_to_depot)
+            nn.SiLU(),
+            nn.Linear(config.node_dim, config.node_dim),
+        )
+
+        self.edge_embed = nn.Sequential(
+            nn.Linear(2, config.edge_dim),  # (distance, affinity)
+            nn.SiLU(),
+            nn.Linear(config.edge_dim, config.edge_dim),
+        )
+
+        # EGNN layers
+        self.layers = nn.ModuleList()
+        for _ in range(config.n_layers):
+            self.layers.append(
+                HeatmapEGNNLayer(
+                    node_dim=config.node_dim,
+                    edge_dim=config.edge_dim,
+                    hidden_dim=config.hidden_dim,
+                    update_coords=config.update_coords,
+                )
+            )
+
+        # Skip connection projections
+        self.skip_projs = nn.ModuleList()
+        for _ in range(config.n_layers // 2):
+            self.skip_projs.append(nn.Linear(config.node_dim * 2, config.node_dim))
+
+        # Heatmap prediction head
+        self.heatmap_head = nn.Sequential(
+            nn.Linear(config.edge_dim, config.edge_dim),
+            nn.SiLU(),
+            nn.Linear(config.edge_dim, config.edge_dim // 2),
+            nn.SiLU(),
+            nn.Linear(config.edge_dim // 2, 1),
+        )
+
+        # Initialize output to small values
+        nn.init.xavier_uniform_(self.heatmap_head[-1].weight, gain=0.1)
+        nn.init.zeros_(self.heatmap_head[-1].bias)
+
+    def forward(
+        self,
+        coords: torch.Tensor,
+        demands: torch.Tensor,
+        capacity: float,
+        edge_index: torch.Tensor,
+        return_embeddings: bool = False
+    ) -> torch.Tensor:
+        """
+        Forward pass producing heatmap.
+
+        Args:
+            coords: (n_nodes, 2) node coordinates
+            demands: (n_nodes,) demand per node
+            capacity: Vehicle capacity
+            edge_index: (2, n_edges) sparse edge indices
+            return_embeddings: Whether to return node embeddings
+
+        Returns:
+            heatmap: (n_nodes, n_nodes) transition probability matrix
+        """
+        n_nodes = coords.size(0)
+        device = coords.device
+        k_sparse = self.config.k_sparse
+
+        # Compute node features (INVARIANT)
+        depot = coords[0:1]
+        dist_to_depot = torch.norm(coords - depot, dim=1, keepdim=True)
+        demand_norm = (demands / capacity).unsqueeze(1)
+        node_feats = torch.cat([demand_norm, dist_to_depot], dim=1)
+
+        # Compute edge features (INVARIANT)
+        src, dst = edge_index
+        edge_dist = torch.norm(coords[dst] - coords[src], dim=1, keepdim=True)
+        max_dist = edge_dist.max() + 1e-8
+        edge_affinity = 1 - edge_dist / max_dist
+        edge_feats = torch.cat([edge_dist, edge_affinity], dim=1)
+
+        # Embed
+        h = self.node_embed(node_feats)
+        e = self.edge_embed(edge_feats)
+        x = coords.clone()
+
+        # EGNN layers with skip connections
+        skip_h = None
+        skip_e = None
+
+        for i, layer in enumerate(self.layers):
+            if i % 2 == 0:
+                skip_h = h
+                skip_e = e
+
+            h, x, e = layer(h, x, edge_index, e)
+
+            if i % 2 == 1 and i < self.config.n_layers - 1:
+                proj_idx = i // 2
+                if proj_idx < len(self.skip_projs):
+                    h = self.skip_projs[proj_idx](torch.cat([h, skip_h], dim=-1))
+                e = e + skip_e
+
+        # Predict heatmap logits
+        logits = self.heatmap_head(e).squeeze(-1)  # (n_edges,)
+
+        # Reshape to per-source softmax
+        logits_matrix = torch.full((n_nodes, n_nodes), float('-inf'), device=device)
+        logits_matrix[src, dst] = logits
+
+        # Softmax per row (per source node)
+        heatmap = F.softmax(logits_matrix, dim=1)
+
+        if return_embeddings:
+            return heatmap, h
+        return heatmap
+
+    @staticmethod
+    def build_knn_graph(coords: torch.Tensor, k: int) -> torch.Tensor:
+        """
+        Build k-NN graph based on distances.
+
+        Args:
+            coords: (n_nodes, 2)
+            k: Number of neighbors
+
+        Returns:
+            edge_index: (2, n_nodes * k)
+        """
+        n_nodes = coords.size(0)
+        device = coords.device
+
+        # Compute distance matrix
+        dist_matrix = torch.cdist(coords, coords)
+
+        # Get k nearest neighbors (excluding self)
+        dist_matrix.fill_diagonal_(float('inf'))
+        _, indices = dist_matrix.topk(k, dim=1, largest=False)
+
+        # Build edge index
+        src = torch.arange(n_nodes, device=device).unsqueeze(1).expand(-1, k).flatten()
+        dst = indices.flatten()
+
+        edge_index = torch.stack([src, dst], dim=0)
+        return edge_index
+
+
+def create_heatmap_model(
+    k_sparse: int = 50,
+    n_layers: int = 8,
+    node_dim: int = 64,
+    **kwargs
+) -> HeatmapEGNN:
+    """Create heatmap-based EGNN model."""
+    config = HeatmapConfig(
+        k_sparse=k_sparse,
+        n_layers=n_layers,
+        node_dim=node_dim,
+        **kwargs
+    )
+    return HeatmapEGNN(config)
+
+
+# ============================================================================
 # MODEL CREATION
 # ============================================================================
 

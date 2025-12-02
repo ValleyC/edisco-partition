@@ -37,7 +37,19 @@ from .model import (
     verify_partition_equivariance,
     compute_route_distance,
     nearest_neighbor_route,
-    create_partition_model
+    create_partition_model,
+    # Heatmap-based EGNN (GLOP-style)
+    HeatmapEGNN,
+    HeatmapConfig,
+    HeatmapEGNNLayer,
+    create_heatmap_model,
+)
+
+# Sequential sampler (GLOP-style)
+from .sampler import (
+    SequentialSampler,
+    routes_to_segments,
+    compute_route_distance as compute_sampled_route_distance,
 )
 
 # Solver components
@@ -85,6 +97,17 @@ __all__ = [
     "compute_route_distance",
     "nearest_neighbor_route",
     "create_partition_model",
+
+    # Heatmap-based EGNN (GLOP-style)
+    "HeatmapEGNN",
+    "HeatmapConfig",
+    "HeatmapEGNNLayer",
+    "create_heatmap_model",
+
+    # Sequential sampler
+    "SequentialSampler",
+    "routes_to_segments",
+    "compute_sampled_route_distance",
 
     # Solver
     "EDISCOPartitionSolver",
