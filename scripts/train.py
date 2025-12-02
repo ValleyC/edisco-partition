@@ -98,9 +98,9 @@ class TrainingConfig:
     # Training
     epochs: int = 100
     batch_size: int = 32
-    learning_rate: float = 1e-4
+    learning_rate: float = 3e-4  # GLOP uses 3e-4
     weight_decay: float = 1e-5
-    warmup_epochs: int = 5
+    warmup_epochs: int = 0  # GLOP uses no warmup
     grad_clip: float = 1.0
     grad_accumulation: int = 1
 
@@ -886,7 +886,7 @@ def main():
     # Training
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--grad_clip', type=float, default=1.0)
 
     # Loss
