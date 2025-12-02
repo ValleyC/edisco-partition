@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edisco-partition"
+version = "0.1.0"
+description = "E(2)-Equivariant Partition Network for Large-Scale CVRP"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "EDISCO Team"}
+]
+keywords = [
+    "vehicle routing",
+    "CVRP",
+    "graph neural networks",
+    "equivariant neural networks",
+    "combinatorial optimization",
+    "deep learning"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=1.12.0",
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "tqdm>=4.60.0",
+]
+
+[project.optional-dependencies]
+visualization = ["matplotlib>=3.5.0"]
+logging = ["tensorboard>=2.8.0", "wandb>=0.12.0"]
+dev = ["pytest>=7.0.0", "pytest-cov>=3.0.0", "black>=22.0.0", "isort>=5.10.0"]
+all = [
+    "matplotlib>=3.5.0",
+    "tensorboard>=2.8.0",
+    "wandb>=0.12.0",
+    "pytest>=7.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/edisco-partition"
+Documentation = "https://github.com/yourusername/edisco-partition#readme"
+Repository = "https://github.com/yourusername/edisco-partition"
+Issues = "https://github.com/yourusername/edisco-partition/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v --tb=short"
