@@ -1,0 +1,10 @@
+torch>=2.0.0
+numpy
+scipy
+tqdm
+pyyaml
+
+# Optional: for GLOP's pretrained revisers
+# torch-scatter
+# torch-sparse
+# torch-geometric
