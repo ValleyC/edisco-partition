@@ -16,8 +16,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.data import Data
 from torch.distributions import Categorical
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class GraphData:
+    """Simple data class to replace torch_geometric.data.Data."""
+    x: torch.Tensor  # Node features
+    edge_index: torch.Tensor  # Edge indices
+    edge_attr: torch.Tensor  # Edge features
+    pos: torch.Tensor  # Node coordinates
 import numpy as np
 import math
 import time
@@ -107,7 +117,7 @@ def gen_pyg_data(coors, demand, capacity, k_sparse):
     edge_attr = torch.cat([edge_dist, edge_affinity], dim=1)
 
     # Include coordinates for EGNN
-    pyg_data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, pos=coors)
+    pyg_data = GraphData(x=x, edge_index=edge_index, edge_attr=edge_attr, pos=coors)
     return pyg_data
 
 
