@@ -221,9 +221,12 @@ class EGNN(nn.Module):
         heatmap = torch.zeros(n_nodes, n_nodes, device=edge_logits.device)
         heatmap[edge_index[0], edge_index[1]] = edge_probs
 
-        # Normalize rows to sum to 1 (handle rows with no outgoing edges)
-        row_sums = heatmap.sum(dim=1, keepdim=True)
-        row_sums = torch.where(row_sums > 0, row_sums, torch.ones_like(row_sums))
-        heatmap = heatmap / row_sums
+        # CRITICAL: Add small epsilon to ALL entries (like GLOP)
+        # This ensures the sampler can always find a feasible transition,
+        # even to nodes not in the k-sparse neighborhood
+        heatmap = heatmap + 1e-5
+
+        # Renormalize rows to sum to 1
+        heatmap = heatmap / heatmap.sum(dim=1, keepdim=True)
 
         return heatmap
