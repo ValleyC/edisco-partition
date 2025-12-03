@@ -215,12 +215,17 @@ class Trainer:
         self.best_val_obj = float('inf')
         self.epoch = 0
 
+        # Exponential moving average baseline for variance reduction
+        self.baseline_ema = None
+        self.baseline_alpha = 0.1  # EMA decay rate
+
     def train_batch(self) -> Tuple[float, float]:
         """Train on a single batch of instances."""
         self.model.train()
 
-        loss_list = []
-        obj_list = []
+        all_costs = []
+        all_log_probs = []
+        all_seq_lens = []
 
         for _ in range(self.config.batch_size):
             # Generate instance
@@ -234,7 +239,7 @@ class Trainer:
             # Forward pass - get heatmap
             heatmap = self.model(coords, demands, capacity, edge_index)
 
-            # Normalize heatmap
+            # Normalize heatmap (ensure positive)
             heatmap = heatmap / (heatmap.min() + 1e-5)
             heatmap = heatmap + 1e-5
 
@@ -247,21 +252,38 @@ class Trainer:
 
             # Evaluate routes
             costs = evaluate_routes_nn(coords, routes)
-            obj_list.append(costs.mean().item())
 
-            # REINFORCE loss with baseline
-            baseline = costs.mean()
-            total_log_prob = log_probs.sum(dim=1)  # Sum over sequence
-            reinforce_loss = ((costs - baseline) * total_log_prob).sum() / self.config.n_samples
+            # Store for batch processing
+            all_costs.append(costs)
+            seq_len = log_probs.size(1)
+            all_seq_lens.append(seq_len)
+            # Normalize log_prob by sequence length to reduce variance
+            all_log_probs.append(log_probs.sum(dim=1) / seq_len)
 
-            loss_list.append(reinforce_loss)
+        # Stack all costs and log_probs
+        all_costs = torch.cat(all_costs)  # (batch_size * n_samples,)
+        all_log_probs = torch.cat(all_log_probs)  # (batch_size * n_samples,)
 
-        # Aggregate loss
-        loss = sum(loss_list) / self.config.batch_size
+        # Update EMA baseline
+        batch_mean_cost = all_costs.mean().item()
+        if self.baseline_ema is None:
+            self.baseline_ema = batch_mean_cost
+        else:
+            self.baseline_ema = (1 - self.baseline_alpha) * self.baseline_ema + self.baseline_alpha * batch_mean_cost
+
+        # Compute advantage with EMA baseline
+        advantage = all_costs - self.baseline_ema
+
+        # Normalize advantage for stability
+        adv_std = advantage.std() + 1e-8
+        advantage_norm = advantage / adv_std
+
+        # REINFORCE loss: E[(cost - baseline) * log_prob]
+        reinforce_loss = (advantage_norm.detach() * all_log_probs).mean()
 
         # Backward pass
         self.optimizer.zero_grad()
-        loss.backward()
+        reinforce_loss.backward()
 
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(
@@ -271,7 +293,7 @@ class Trainer:
 
         self.optimizer.step()
 
-        return loss.item(), np.mean(obj_list)
+        return reinforce_loss.item(), batch_mean_cost
 
     def train_epoch(self) -> Tuple[float, float]:
         """Train for one epoch."""
@@ -288,7 +310,7 @@ class Trainer:
             pbar.set_postfix({
                 'loss': f'{loss:.4f}',
                 'obj': f'{obj:.2f}',
-                'avg': f'{np.mean(objs):.2f}'
+                'bl': f'{self.baseline_ema:.2f}' if self.baseline_ema else 'N/A'
             })
 
         self.scheduler.step()
