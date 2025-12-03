@@ -9,15 +9,6 @@ This repository implements an E(2)-equivariant graph neural network for partitio
 - **REINFORCE Training**: Policy gradient optimization directly on routing cost.
 - **Scalable**: Designed for large-scale CVRP (500-2000+ customers).
 
-## Key Difference from GLOP
-
-Unlike [GLOP](https://github.com/henry-yeh/GLOP) which uses polar angle θ as a node feature (breaking rotation equivariance), we use only **invariant** features:
-
-| Feature | GLOP | Ours |
-|---------|------|------|
-| Node features | (demand, r, **θ**) | (demand, r) |
-| Equivariance | ❌ | ✅ E(2) |
-
 ## Installation
 
 ```bash
@@ -105,28 +96,3 @@ edisco-partition/
 │   └── train.py              # Training script
 └── checkpoints/              # Saved models
 ```
-
-## Using GLOP's Pretrained Revisers
-
-For higher quality evaluation at inference time, you can use GLOP's pretrained TSP revisers:
-
-1. Download from [GLOP Google Drive](https://drive.google.com/file/d/1u9-GVTMRux3rWGcbipSqyTyBx_V8pm9G/view)
-2. Extract to `pretrained/`
-
-## Citation
-
-If you use this code, please cite:
-
-```bibtex
-@article{edisco_partition,
-  title={E(2)-Equivariant Neural Partitioning for Large-Scale CVRP},
-  author={Your Name},
-  year={2025}
-}
-```
-
-## Acknowledgments
-
-- [GLOP](https://github.com/henry-yeh/GLOP) for the sequential sampling approach
-- [EDISCO](https://github.com/yourusername/EDISCO) for the EGNN architecture
-- [EGNN Paper](https://arxiv.org/abs/2102.09844) for the equivariant GNN framework
