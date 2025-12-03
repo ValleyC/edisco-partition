@@ -290,6 +290,169 @@ def eval_routes(coors, routes):
 
 
 # ============================================================================
+# LKH EVALUATION (optional, for higher quality training signal)
+# ============================================================================
+
+import subprocess
+import tempfile
+import shutil
+
+def find_lkh():
+    """Find LKH executable."""
+    # Check environment variable
+    env_path = os.environ.get('LKH_PATH')
+    if env_path and os.path.isfile(env_path):
+        return env_path
+    # Check system PATH
+    system_lkh = shutil.which('LKH')
+    if system_lkh:
+        return system_lkh
+    # Common paths
+    home = os.path.expanduser("~")
+    for path in [f"{home}/LKH_install/LKH-3.0.8/LKH", f"{home}/LKH_install/LKH-3.0.6/LKH",
+                 f"{home}/Code/CVRP/LKH-3.0.8/LKH", f"{home}/LKH-3.0.8/LKH", f"{home}/LKH-3/LKH",
+                 "/usr/local/bin/LKH", "./LKH-3.0.8/LKH", "./LKH"]:
+        if os.path.isfile(path):
+            return path
+    return None
+
+LKH_PATH = find_lkh()
+
+def eval_routes_lkh(coors, routes, capacity, demand, time_limit=1, max_trials=100):
+    """
+    Evaluate routes using LKH-3 for each segment (TSP).
+    Much higher quality than NN, but slower.
+
+    Args:
+        time_limit: seconds per segment (default 1)
+        max_trials: LKH trials per segment (default 100)
+    """
+    if LKH_PATH is None:
+        return eval_routes(coors, routes)  # Fallback to NN
+
+    bs = routes.size(0)
+    costs = []
+    coors_np = coors.cpu().numpy()
+    depot = coors_np[0]
+
+    for i in range(bs):
+        route = routes[i].cpu().numpy()
+        cost = 0.0
+
+        # Split route at depot visits
+        segments = []
+        current_seg = []
+        for node in route:
+            if node == 0:
+                if current_seg:
+                    segments.append(current_seg)
+                    current_seg = []
+            else:
+                current_seg.append(node)
+        if current_seg:
+            segments.append(current_seg)
+
+        # Solve TSP for each segment with LKH
+        for seg in segments:
+            if not seg:
+                continue
+            n = len(seg)
+            if n == 1:
+                cost += 2 * np.linalg.norm(depot - coors_np[seg[0]])
+                continue
+            if n == 2:
+                cost += np.linalg.norm(depot - coors_np[seg[0]])
+                cost += np.linalg.norm(coors_np[seg[0]] - coors_np[seg[1]])
+                cost += np.linalg.norm(coors_np[seg[1]] - depot)
+                continue
+
+            # Build TSP with depot
+            seg_with_depot = [0] + seg
+            seg_coords = coors_np[seg_with_depot]
+
+            try:
+                seg_cost = solve_tsp_lkh(seg_coords, time_limit, max_trials)
+                cost += seg_cost
+            except:
+                # Fallback to NN for this segment
+                seg_coords_only = coors_np[seg]
+                visited = [False] * n
+                current = depot
+                seg_cost = 0.0
+                for _ in range(n):
+                    best_d, best_j = float('inf'), -1
+                    for j in range(n):
+                        if not visited[j]:
+                            d = np.linalg.norm(current - seg_coords_only[j])
+                            if d < best_d:
+                                best_d, best_j = d, j
+                    if best_j >= 0:
+                        visited[best_j] = True
+                        seg_cost += best_d
+                        current = seg_coords_only[best_j]
+                seg_cost += np.linalg.norm(current - depot)
+                cost += seg_cost
+
+        costs.append(cost)
+
+    return torch.tensor(costs, device=coors.device)
+
+
+def solve_tsp_lkh(coords, time_limit=1, max_trials=100):
+    """Solve TSP using LKH-3."""
+    n = len(coords)
+    scale = 100000
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        prob_file = os.path.join(tmpdir, "problem.tsp")
+        par_file = os.path.join(tmpdir, "param.par")
+        tour_file = os.path.join(tmpdir, "tour.txt")
+
+        # Write TSP file
+        with open(prob_file, 'w') as f:
+            f.write(f"NAME : seg\nTYPE : TSP\nDIMENSION : {n}\n")
+            f.write("EDGE_WEIGHT_TYPE : EUC_2D\nNODE_COORD_SECTION\n")
+            for i, (x, y) in enumerate(coords):
+                f.write(f"{i+1} {int(x*scale)} {int(y*scale)}\n")
+            f.write("EOF\n")
+
+        # Write param file
+        with open(par_file, 'w') as f:
+            f.write(f"PROBLEM_FILE = {prob_file}\n")
+            f.write(f"OUTPUT_TOUR_FILE = {tour_file}\n")
+            f.write(f"TIME_LIMIT = {time_limit}\n")
+            f.write(f"MAX_TRIALS = {max_trials}\n")
+            f.write("RUNS = 1\n")
+            f.write("SEED = 1\n")
+
+        # Run LKH
+        subprocess.run([LKH_PATH, par_file], capture_output=True, timeout=time_limit+5)
+
+        # Parse tour and compute distance
+        with open(tour_file, 'r') as f:
+            lines = f.readlines()
+
+        tour = []
+        in_tour = False
+        for line in lines:
+            if "TOUR_SECTION" in line:
+                in_tour = True
+                continue
+            if in_tour:
+                node = int(line.strip())
+                if node == -1:
+                    break
+                tour.append(node - 1)  # 0-indexed
+
+        # Compute tour length
+        cost = 0.0
+        for i in range(len(tour)):
+            cost += np.linalg.norm(coords[tour[i]] - coords[tour[(i+1) % len(tour)]])
+
+        return cost
+
+
+# ============================================================================
 # EGNN NETWORK (replaces GLOP's EmbNet+ParNet)
 # ============================================================================
 
@@ -445,8 +608,13 @@ def train_batch(model, optimizer, n, bs, opts):
         sampler = Sampler(demand, heatmap, capacity, bs, DEVICE)
         routes, log_probs = sampler.gen_subsets(require_prob=True)
 
-        # Simple evaluation (replaces GLOP's revisers)
-        objs = eval_routes(coors, routes)
+        # Evaluation - use LKH if enabled, otherwise NN
+        if opts.use_lkh and LKH_PATH is not None:
+            objs = eval_routes_lkh(coors, routes, capacity, demand,
+                                   time_limit=opts.lkh_time_limit,
+                                   max_trials=opts.lkh_max_trials)
+        else:
+            objs = eval_routes(coors, routes)
 
         # REINFORCE - exact same as GLOP
         baseline = objs.mean()
@@ -487,7 +655,13 @@ def validation(n, net, opts):
         heatmap = infer_heatmap(net, pyg_data)
         sampler = Sampler(demand, heatmap, capacity, 1, DEVICE)
         routes = sampler.gen_subsets(require_prob=False, greedy_mode=True)
-        obj = eval_routes(coors, routes).min()
+        # Use LKH for validation if enabled
+        if opts.use_lkh and LKH_PATH is not None:
+            obj = eval_routes_lkh(coors, routes, capacity, demand,
+                                  time_limit=opts.lkh_time_limit,
+                                  max_trials=opts.lkh_max_trials).min()
+        else:
+            obj = eval_routes(coors, routes).min()
         sum_obj += obj.item()
     return sum_obj / opts.val_size
 
@@ -590,6 +764,10 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=10)
     parser.add_argument('--depth', type=int, default=12)
     parser.add_argument('--seed', type=int, default=1)
+    # LKH options
+    parser.add_argument('--use_lkh', action='store_true', help='Use LKH-3 for route evaluation')
+    parser.add_argument('--lkh_time_limit', type=int, default=1, help='LKH time limit per segment (seconds)')
+    parser.add_argument('--lkh_max_trials', type=int, default=100, help='LKH max trials per segment')
 
     opts = parser.parse_args()
 
@@ -604,6 +782,13 @@ if __name__ == '__main__':
     print(f"Width (samples): {opts.width}")
     print(f"Batch size: {opts.batch_size}")
     print(f"Device: {DEVICE}")
+    if opts.use_lkh:
+        if LKH_PATH:
+            print(f"LKH: enabled (time={opts.lkh_time_limit}s, trials={opts.lkh_max_trials})")
+        else:
+            print("LKH: requested but NOT FOUND - falling back to NN")
+    else:
+        print("LKH: disabled (using NN routing)")
     print("=" * 60)
 
     train(opts.problem_size, opts.width, opts.steps_per_epoch, opts.n_epochs, opts)
