@@ -29,7 +29,9 @@ from edisco_partition.data.instance import generate_instance, CAPACITIES
 from edisco_partition.data.graph import build_graph, build_graph_cosine
 from edisco_partition.sampler.sequential import Sampler
 from edisco_partition.evaluation.nn_routing import eval_routes_nn
-from edisco_partition.evaluation.lkh_routing import eval_routes_lkh, LKH_PATH
+from edisco_partition.evaluation.lkh_routing import (
+    eval_routes_lkh, eval_routes_lkh_parallel, eval_routes_lkh_parallel_batch, LKH_PATH
+)
 from edisco_partition.utils.helpers import (
     set_seed, get_device, count_parameters,
     save_checkpoint, load_checkpoint, AverageMeter, check_equivariance
@@ -57,7 +59,7 @@ def get_k_sparse(n):
 
 def train_step(model, optimizer, n_customers, batch_size, width, device, opts):
     """
-    Single training step.
+    Single training step with parallel LKH support.
 
     Args:
         model: PartitionNet
@@ -74,15 +76,18 @@ def train_step(model, optimizer, n_customers, batch_size, width, device, opts):
     """
     model.train()
 
-    loss_list = []
-    cost_list = []
+    # Collect data for batch-parallel LKH evaluation
+    coords_list = []
+    routes_list = []
+    log_probs_list = []
+
+    k_sparse = get_k_sparse(n_customers)
 
     for _ in range(batch_size):
         # Generate instance
         coords, demand, capacity = generate_instance(n_customers, device)
 
         # Build E(2)-equivariant graph
-        k_sparse = get_k_sparse(n_customers)
         if opts.use_cosine:
             graph = build_graph_cosine(coords, demand, capacity, k_sparse)
         else:
@@ -95,16 +100,27 @@ def train_step(model, optimizer, n_customers, batch_size, width, device, opts):
         sampler = Sampler(demand, heatmap, capacity, width, device)
         routes, log_probs = sampler.gen_subsets(require_prob=True)
 
-        # Evaluate routes
-        if opts.use_lkh and LKH_PATH is not None:
-            costs = eval_routes_lkh(
-                coords, routes, capacity, demand,
-                time_limit=opts.lkh_time_limit,
-                max_trials=opts.lkh_max_trials
-            )
-        else:
-            costs = eval_routes_nn(coords, routes)
+        coords_list.append(coords)
+        routes_list.append(routes)
+        log_probs_list.append(log_probs)
 
+    # Evaluate routes (parallel for LKH)
+    if opts.use_lkh and LKH_PATH is not None:
+        # Use batch-parallel LKH - all tasks from all instances run in parallel
+        costs_list = eval_routes_lkh_parallel_batch(
+            coords_list, routes_list,
+            time_limit=opts.lkh_time_limit,
+            max_trials=opts.lkh_max_trials,
+            n_workers=opts.lkh_workers
+        )
+    else:
+        costs_list = [eval_routes_nn(c, r) for c, r in zip(coords_list, routes_list)]
+
+    # Compute REINFORCE loss
+    loss_list = []
+    cost_list = []
+
+    for costs, log_probs in zip(costs_list, log_probs_list):
         # REINFORCE
         baseline = costs.mean()
         log_probs_sum = log_probs.sum(dim=1)  # Sum over time steps
@@ -136,7 +152,7 @@ def train_step(model, optimizer, n_customers, batch_size, width, device, opts):
 @torch.no_grad()
 def validate(model, n_customers, val_size, device, opts):
     """
-    Validation loop.
+    Validation loop with parallel LKH support.
 
     Args:
         model: PartitionNet
@@ -150,8 +166,11 @@ def validate(model, n_customers, val_size, device, opts):
     """
     model.eval()
 
-    total_cost = 0.0
     k_sparse = get_k_sparse(n_customers)
+
+    # Collect all validation instances
+    coords_list = []
+    routes_list = []
 
     for _ in range(val_size):
         coords, demand, capacity = generate_instance(n_customers, device)
@@ -167,16 +186,22 @@ def validate(model, n_customers, val_size, device, opts):
         sampler = Sampler(demand, heatmap, capacity, 1, device)
         routes = sampler.gen_subsets(require_prob=False, greedy_mode=True)
 
-        if opts.use_lkh and LKH_PATH is not None:
-            cost = eval_routes_lkh(
-                coords, routes, capacity, demand,
-                time_limit=opts.lkh_time_limit,
-                max_trials=opts.lkh_max_trials
-            ).min()
-        else:
-            cost = eval_routes_nn(coords, routes).min()
+        coords_list.append(coords)
+        routes_list.append(routes)
 
-        total_cost += cost.item()
+    # Evaluate all in parallel
+    if opts.use_lkh and LKH_PATH is not None:
+        costs_list = eval_routes_lkh_parallel_batch(
+            coords_list, routes_list,
+            time_limit=opts.lkh_time_limit,
+            max_trials=opts.lkh_max_trials,
+            n_workers=opts.lkh_workers
+        )
+    else:
+        costs_list = [eval_routes_nn(c, r) for c, r in zip(coords_list, routes_list)]
+
+    # Sum costs
+    total_cost = sum(costs.min().item() for costs in costs_list)
 
     return total_cost / val_size
 
@@ -238,7 +263,10 @@ def train(opts):
     print(f"Steps per epoch: {opts.steps_per_epoch}")
     print(f"Batch size: {opts.batch_size}")
     print(f"Width (samples): {opts.width}")
-    print(f"Using LKH: {opts.use_lkh and LKH_PATH is not None}")
+    if opts.use_lkh and LKH_PATH is not None:
+        print(f"Using LKH: Yes (parallel, {opts.lkh_workers} workers, time_limit={opts.lkh_time_limit}s)")
+    else:
+        print(f"Using LKH: No (using NN routing)")
     print("-" * 60)
 
     for epoch in range(start_epoch, opts.n_epochs + 1):
@@ -360,11 +388,13 @@ def main():
 
     # Evaluation settings
     parser.add_argument('--use_lkh', action='store_true',
-                        help='Use LKH for evaluation (slower but better)')
-    parser.add_argument('--lkh_time_limit', type=int, default=1,
-                        help='LKH time limit per segment')
-    parser.add_argument('--lkh_max_trials', type=int, default=100,
-                        help='LKH max trials per segment')
+                        help='Use LKH for evaluation (better quality, parallelized)')
+    parser.add_argument('--lkh_time_limit', type=float, default=0.1,
+                        help='LKH time limit per segment (0.1s is enough for small TSPs)')
+    parser.add_argument('--lkh_max_trials', type=int, default=10,
+                        help='LKH max trials per segment (10 is enough for small TSPs)')
+    parser.add_argument('--lkh_workers', type=int, default=8,
+                        help='Number of parallel workers for LKH evaluation')
 
     # Checkpoint
     parser.add_argument('--checkpoint', type=str, default='',

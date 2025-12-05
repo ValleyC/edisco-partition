@@ -2,7 +2,7 @@
 LKH-3 Routing for CVRP Evaluation.
 
 Higher quality than nearest neighbor, but slower.
-Use for validation/testing, not training.
+Supports parallel execution for faster training.
 """
 
 import os
@@ -11,6 +11,8 @@ import tempfile
 import shutil
 import numpy as np
 import torch
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from functools import partial
 
 
 def find_lkh():
@@ -190,3 +192,235 @@ def _solve_tsp_lkh(coords, time_limit=1, max_trials=100):
             cost += np.linalg.norm(coords[tour[i]] - coords[tour[(i+1) % len(tour)]])
 
         return cost
+
+
+# ============================================================================
+# Parallel LKH Evaluation for Training
+# ============================================================================
+
+def _solve_single_route_task(args):
+    """
+    Worker function for parallel evaluation.
+    Takes a tuple of arguments to be pickle-compatible.
+    """
+    coords_np, route, time_limit, max_trials, lkh_path = args
+    depot = coords_np[0]
+
+    cost = 0.0
+
+    # Split route at depot visits
+    segments = []
+    current_seg = []
+
+    for node in route:
+        if node == 0:
+            if current_seg:
+                segments.append(current_seg)
+                current_seg = []
+        else:
+            current_seg.append(node)
+
+    if current_seg:
+        segments.append(current_seg)
+
+    # Solve each segment
+    for seg in segments:
+        if not seg:
+            continue
+
+        n = len(seg)
+        if n == 1:
+            cost += 2 * np.linalg.norm(depot - coords_np[seg[0]])
+        elif n == 2:
+            cost += np.linalg.norm(depot - coords_np[seg[0]])
+            cost += np.linalg.norm(coords_np[seg[0]] - coords_np[seg[1]])
+            cost += np.linalg.norm(coords_np[seg[1]] - depot)
+        else:
+            # Build TSP instance with depot
+            seg_with_depot = [0] + seg
+            seg_coords = coords_np[seg_with_depot]
+
+            try:
+                seg_cost = _solve_tsp_lkh_worker(seg_coords, time_limit, max_trials, lkh_path)
+                cost += seg_cost
+            except Exception:
+                # Fallback to NN for this segment
+                cost += _nn_tsp_fallback(depot, coords_np[seg])
+
+    return cost
+
+
+def _solve_tsp_lkh_worker(coords, time_limit, max_trials, lkh_path):
+    """LKH solver that takes lkh_path as argument (for multiprocessing)."""
+    n = len(coords)
+    scale = 100000
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        prob_file = os.path.join(tmpdir, "problem.tsp")
+        par_file = os.path.join(tmpdir, "param.par")
+        tour_file = os.path.join(tmpdir, "tour.txt")
+
+        # Write TSP file
+        with open(prob_file, 'w') as f:
+            f.write(f"NAME : seg\n")
+            f.write(f"TYPE : TSP\n")
+            f.write(f"DIMENSION : {n}\n")
+            f.write(f"EDGE_WEIGHT_TYPE : EUC_2D\n")
+            f.write(f"NODE_COORD_SECTION\n")
+            for i, (x, y) in enumerate(coords):
+                f.write(f"{i+1} {int(x*scale)} {int(y*scale)}\n")
+            f.write("EOF\n")
+
+        # Write parameter file
+        with open(par_file, 'w') as f:
+            f.write(f"PROBLEM_FILE = {prob_file}\n")
+            f.write(f"OUTPUT_TOUR_FILE = {tour_file}\n")
+            f.write(f"TIME_LIMIT = {time_limit}\n")
+            f.write(f"MAX_TRIALS = {max_trials}\n")
+            f.write("RUNS = 1\n")
+            f.write("SEED = 1\n")
+
+        # Run LKH
+        subprocess.run(
+            [lkh_path, par_file],
+            capture_output=True,
+            timeout=time_limit + 5
+        )
+
+        # Parse tour
+        with open(tour_file, 'r') as f:
+            lines = f.readlines()
+
+        tour = []
+        in_tour = False
+        for line in lines:
+            if "TOUR_SECTION" in line:
+                in_tour = True
+                continue
+            if in_tour:
+                node = int(line.strip())
+                if node == -1:
+                    break
+                tour.append(node - 1)
+
+        # Compute tour length
+        cost = 0.0
+        for i in range(len(tour)):
+            cost += np.linalg.norm(coords[tour[i]] - coords[tour[(i+1) % len(tour)]])
+
+        return cost
+
+
+def _nn_tsp_fallback(depot, seg_coords):
+    """Nearest neighbor fallback (doesn't require import)."""
+    n = len(seg_coords)
+    visited = [False] * n
+    current = depot
+    cost = 0.0
+
+    for _ in range(n):
+        best_dist = float('inf')
+        best_idx = -1
+
+        for j in range(n):
+            if not visited[j]:
+                dist = np.linalg.norm(current - seg_coords[j])
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = j
+
+        if best_idx >= 0:
+            visited[best_idx] = True
+            cost += best_dist
+            current = seg_coords[best_idx]
+
+    cost += np.linalg.norm(current - depot)
+    return cost
+
+
+def eval_routes_lkh_parallel(coords, routes, capacity=None, demand=None,
+                              time_limit=0.1, max_trials=10, n_workers=8):
+    """
+    Parallel LKH evaluation for training.
+
+    Args:
+        coords: (n_nodes, 2) - node coordinates
+        routes: (batch_size, route_length) - sampled routes
+        capacity: Not used, kept for API compatibility
+        demand: Not used, kept for API compatibility
+        time_limit: Seconds per segment (default 0.1 for small TSPs)
+        max_trials: LKH trials per segment (default 10 for speed)
+        n_workers: Number of parallel workers
+
+    Returns:
+        costs: (batch_size,) - total route distances
+    """
+    from .nn_routing import eval_routes_nn
+
+    if LKH_PATH is None:
+        print("Warning: LKH not found, falling back to NN routing")
+        return eval_routes_nn(coords, routes)
+
+    bs = routes.size(0)
+    coords_np = coords.cpu().numpy()
+
+    # Prepare tasks
+    tasks = [
+        (coords_np, routes[i].cpu().numpy(), time_limit, max_trials, LKH_PATH)
+        for i in range(bs)
+    ]
+
+    # Run in parallel using ThreadPoolExecutor (better for I/O-bound subprocess calls)
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        costs = list(executor.map(_solve_single_route_task, tasks))
+
+    return torch.tensor(costs, device=coords.device, dtype=torch.float)
+
+
+def eval_routes_lkh_parallel_batch(coords_list, routes_list, capacity=None, demand=None,
+                                    time_limit=0.1, max_trials=10, n_workers=8):
+    """
+    Parallel LKH evaluation across multiple instances (for batch training).
+
+    Args:
+        coords_list: List of (n_nodes, 2) coordinate tensors
+        routes_list: List of (width, route_length) route tensors
+        time_limit: Seconds per segment
+        max_trials: LKH trials per segment
+        n_workers: Number of parallel workers
+
+    Returns:
+        costs_list: List of (width,) cost tensors
+    """
+    from .nn_routing import eval_routes_nn
+
+    if LKH_PATH is None:
+        print("Warning: LKH not found, falling back to NN routing")
+        return [eval_routes_nn(c, r) for c, r in zip(coords_list, routes_list)]
+
+    # Flatten all tasks
+    all_tasks = []
+    task_indices = []  # Track which instance each task belongs to
+
+    for inst_idx, (coords, routes) in enumerate(zip(coords_list, routes_list)):
+        coords_np = coords.cpu().numpy()
+        for route_idx in range(routes.size(0)):
+            all_tasks.append(
+                (coords_np, routes[route_idx].cpu().numpy(), time_limit, max_trials, LKH_PATH)
+            )
+            task_indices.append((inst_idx, route_idx))
+
+    # Run all tasks in parallel
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        all_costs = list(executor.map(_solve_single_route_task, all_tasks))
+
+    # Reorganize results
+    costs_list = [torch.zeros(routes.size(0)) for routes in routes_list]
+    for (inst_idx, route_idx), cost in zip(task_indices, all_costs):
+        costs_list[inst_idx][route_idx] = cost
+
+    # Move to correct device
+    for i, coords in enumerate(coords_list):
+        costs_list[i] = costs_list[i].to(coords.device)
+
+    return costs_list
