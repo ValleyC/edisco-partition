@@ -417,7 +417,7 @@ def eval_routes_lkh_parallel_batch(coords_list, routes_list, capacity=None, dema
     # Reorganize results
     costs_list = [torch.zeros(routes.size(0)) for routes in routes_list]
     for (inst_idx, route_idx), cost in zip(task_indices, all_costs):
-        costs_list[inst_idx][route_idx] = cost
+        costs_list[inst_idx][route_idx] = float(cost)  # Convert numpy to Python float
 
     # Move to correct device
     for i, coords in enumerate(coords_list):
