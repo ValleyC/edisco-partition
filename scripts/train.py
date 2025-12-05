@@ -32,6 +32,7 @@ from edisco_partition.evaluation.nn_routing import eval_routes_nn
 from edisco_partition.evaluation.lkh_routing import (
     eval_routes_lkh, eval_routes_lkh_parallel, eval_routes_lkh_parallel_batch, LKH_PATH
 )
+from edisco_partition.evaluation.reviser_routing import ReviserEvaluator
 from edisco_partition.utils.helpers import (
     set_seed, get_device, count_parameters,
     save_checkpoint, load_checkpoint, AverageMeter, check_equivariance
@@ -57,9 +58,9 @@ def get_k_sparse(n):
     return min(200, max(20, n // 10))
 
 
-def train_step(model, optimizer, n_customers, batch_size, width, device, opts):
+def train_step(model, optimizer, n_customers, batch_size, width, device, opts, reviser_evaluator=None):
     """
-    Single training step with parallel LKH support.
+    Single training step with parallel LKH or Reviser support.
 
     Args:
         model: PartitionNet
@@ -69,6 +70,7 @@ def train_step(model, optimizer, n_customers, batch_size, width, device, opts):
         width: Number of samples per instance
         device: Device
         opts: Training options
+        reviser_evaluator: Optional ReviserEvaluator for Reviser-based evaluation
 
     Returns:
         loss: Training loss value
@@ -104,8 +106,11 @@ def train_step(model, optimizer, n_customers, batch_size, width, device, opts):
         routes_list.append(routes)
         log_probs_list.append(log_probs)
 
-    # Evaluate routes (parallel for LKH)
-    if opts.use_lkh and LKH_PATH is not None:
+    # Evaluate routes
+    if reviser_evaluator is not None:
+        # Use Reviser for evaluation (GPU-accelerated, like GLOP)
+        costs_list = reviser_evaluator.eval_routes_batch(coords_list, routes_list)
+    elif opts.use_lkh and LKH_PATH is not None:
         # Use batch-parallel LKH - all tasks from all instances run in parallel
         costs_list = eval_routes_lkh_parallel_batch(
             coords_list, routes_list,
@@ -150,9 +155,9 @@ def train_step(model, optimizer, n_customers, batch_size, width, device, opts):
 
 
 @torch.no_grad()
-def validate(model, n_customers, val_size, device, opts):
+def validate(model, n_customers, val_size, device, opts, reviser_evaluator=None):
     """
-    Validation loop with parallel LKH support.
+    Validation loop with parallel LKH or Reviser support.
 
     Args:
         model: PartitionNet
@@ -160,6 +165,7 @@ def validate(model, n_customers, val_size, device, opts):
         val_size: Number of validation instances
         device: Device
         opts: Options
+        reviser_evaluator: Optional ReviserEvaluator for Reviser-based evaluation
 
     Returns:
         avg_cost: Average validation cost
@@ -190,7 +196,10 @@ def validate(model, n_customers, val_size, device, opts):
         routes_list.append(routes)
 
     # Evaluate all in parallel
-    if opts.use_lkh and LKH_PATH is not None:
+    if reviser_evaluator is not None:
+        # Use Reviser for evaluation
+        costs_list = reviser_evaluator.eval_routes_batch(coords_list, routes_list)
+    elif opts.use_lkh and LKH_PATH is not None:
         costs_list = eval_routes_lkh_parallel_batch(
             coords_list, routes_list,
             time_limit=opts.lkh_time_limit,
@@ -210,6 +219,24 @@ def train(opts):
     """Main training function."""
     device = get_device(opts.device)
     set_seed(opts.seed)
+
+    # Initialize Reviser evaluator if requested
+    reviser_evaluator = None
+    if opts.use_reviser:
+        try:
+            reviser_evaluator = ReviserEvaluator(
+                revision_lens=opts.revision_lens,
+                revision_iters=opts.revision_iters,
+                pretrained_path=opts.reviser_path if opts.reviser_path else None,
+                device=str(device),
+                no_aug=opts.reviser_no_aug,
+                decode_strategy='greedy',
+            )
+            print(f"Loaded Reviser models: {opts.revision_lens}")
+        except Exception as e:
+            print(f"Warning: Failed to load Reviser: {e}")
+            print("Falling back to NN routing")
+            reviser_evaluator = None
 
     # Create model
     model = PartitionNet(
@@ -244,7 +271,7 @@ def train(opts):
     os.makedirs(save_dir, exist_ok=True)
 
     # Initial validation
-    val_cost = validate(model, opts.problem_size, opts.val_size, device, opts)
+    val_cost = validate(model, opts.problem_size, opts.val_size, device, opts, reviser_evaluator)
     print(f"Initial validation cost: {val_cost:.4f}")
     best_val_cost = val_cost
 
@@ -263,10 +290,12 @@ def train(opts):
     print(f"Steps per epoch: {opts.steps_per_epoch}")
     print(f"Batch size: {opts.batch_size}")
     print(f"Width (samples): {opts.width}")
-    if opts.use_lkh and LKH_PATH is not None:
+    if reviser_evaluator is not None:
+        print(f"Using Reviser: Yes (revision_lens={opts.revision_lens}, iters={opts.revision_iters})")
+    elif opts.use_lkh and LKH_PATH is not None:
         print(f"Using LKH: Yes (parallel, {opts.lkh_workers} workers, time_limit={opts.lkh_time_limit}s)")
     else:
-        print(f"Using LKH: No (using NN routing)")
+        print(f"Using: NN routing (fastest but lowest quality)")
     print("-" * 60)
 
     for epoch in range(start_epoch, opts.n_epochs + 1):
@@ -279,7 +308,7 @@ def train(opts):
             loss, cost = train_step(
                 model, optimizer,
                 opts.problem_size, opts.batch_size, opts.width,
-                device, opts
+                device, opts, reviser_evaluator
             )
             loss_meter.update(loss)
             cost_meter.update(cost)
@@ -294,7 +323,7 @@ def train(opts):
         epoch_time = time.time() - epoch_start
 
         # Validation
-        val_cost = validate(model, opts.problem_size, opts.val_size, device, opts)
+        val_cost = validate(model, opts.problem_size, opts.val_size, device, opts, reviser_evaluator)
 
         # Check equivariance periodically
         if epoch % 5 == 0:
@@ -395,6 +424,18 @@ def main():
                         help='LKH max trials per segment (10 is enough for small TSPs)')
     parser.add_argument('--lkh_workers', type=int, default=8,
                         help='Number of parallel workers for LKH evaluation')
+
+    # Reviser settings (GLOP pretrained TSP solver)
+    parser.add_argument('--use_reviser', action='store_true',
+                        help='Use GLOP Reviser for evaluation (GPU-accelerated, like GLOP)')
+    parser.add_argument('--revision_lens', nargs='+', type=int, default=[20],
+                        help='Reviser sizes to use (default: [20])')
+    parser.add_argument('--revision_iters', nargs='+', type=int, default=[5],
+                        help='Revision iterations per reviser (default: [5])')
+    parser.add_argument('--reviser_path', type=str, default='',
+                        help='Path to pretrained Reviser models (auto-detected if empty)')
+    parser.add_argument('--reviser_no_aug', action='store_true',
+                        help='Disable Reviser augmentation (faster but slightly worse)')
 
     # Checkpoint
     parser.add_argument('--checkpoint', type=str, default='',
