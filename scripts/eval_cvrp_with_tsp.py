@@ -725,9 +725,9 @@ def visualize_cvrp_solution(coords, routes, demand=None, title="CVRP Solution", 
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved visualization to {save_path}")
-
-    plt.show()
+        plt.close(fig)  # Close to free memory when saving many images
+    else:
+        plt.show()
     return fig
 
 
@@ -747,9 +747,15 @@ def main():
     parser.add_argument('--n_instances', type=int, default=10, help='Number of instances to evaluate')
     parser.add_argument('--device', type=str, default='cuda', help='Device')
     parser.add_argument('--visualize', action='store_true', help='Visualize solutions')
+    parser.add_argument('--output_dir', type=str, default='eval_results', help='Output directory for visualizations')
     parser.add_argument('--use_lkh', action='store_true', help='Use LKH-3 for sub-TSP solving (recommended)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     args = parser.parse_args()
+
+    # Create output directory if visualizing
+    if args.visualize:
+        os.makedirs(args.output_dir, exist_ok=True)
+        print(f"Saving visualizations to: {args.output_dir}/")
 
     # Check LKH availability
     if args.use_lkh:
@@ -865,12 +871,13 @@ def main():
         print(f"Instance {i+1}: NN={cost_nn:.2f}, {solver_name}={cost_tsp:.2f}, "
               f"Routes={len(routes)}, Improvement={(cost_nn-cost_tsp)/cost_nn*100:.1f}%")
 
-        # Visualize first few instances
-        if args.visualize and i < 3:
+        # Visualize all instances
+        if args.visualize:
+            save_path = os.path.join(args.output_dir, f"cvrp_{args.n_customers}_instance_{i+1}.png")
             visualize_cvrp_solution(
                 coords, optimized_routes, demand,
                 title=f"CVRP-{args.n_customers} Instance {i+1} (Cost: {cost_tsp:.2f})",
-                save_path=f"cvrp_{args.n_customers}_instance_{i+1}.png"
+                save_path=save_path
             )
 
     # Summary
