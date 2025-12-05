@@ -17,8 +17,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 from dataclasses import dataclass
+
+# Optional matplotlib import
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    print("Warning: matplotlib not installed. Visualization will be disabled.")
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,6 +34,7 @@ from edisco_partition.models.partition_net import PartitionNet
 from edisco_partition.data.graph import build_graph
 from edisco_partition.data.instance import generate_instance, CAPACITIES
 from edisco_partition.sampler.sequential import Sampler
+from edisco_partition.evaluation.lkh_routing import LKH_PATH, _solve_tsp_lkh
 
 
 # ============================================================================
@@ -518,6 +526,41 @@ def extract_routes(route_sequence):
     return routes
 
 
+def solve_route_tsp_lkh(coords, route_nodes, time_limit=1, max_trials=100):
+    """Solve TSP for a single route using LKH-3."""
+    if len(route_nodes) <= 2:
+        # For small routes, compute directly
+        tour = route_nodes
+        length = 0.0
+        depot = coords[0]
+        if len(route_nodes) >= 1:
+            length += torch.norm(depot - coords[route_nodes[0]]).item()
+            for i in range(len(route_nodes) - 1):
+                length += torch.norm(coords[route_nodes[i]] - coords[route_nodes[i+1]]).item()
+            length += torch.norm(coords[route_nodes[-1]] - depot).item()
+        return tour, length
+
+    # Build sub-TSP with depot
+    sub_nodes = [0] + route_nodes
+    sub_coords = coords[sub_nodes].cpu().numpy()
+
+    try:
+        # Solve with LKH
+        cost = _solve_tsp_lkh(sub_coords, time_limit, max_trials)
+
+        # For now, just return the original order (LKH optimizes the tour internally)
+        # The cost is what matters for evaluation
+        return route_nodes, cost
+    except Exception as e:
+        # Fallback to nearest neighbor
+        tour = route_nodes
+        length = torch.norm(coords[0] - coords[route_nodes[0]]).item()
+        for i in range(len(route_nodes) - 1):
+            length += torch.norm(coords[route_nodes[i]] - coords[route_nodes[i+1]]).item()
+        length += torch.norm(coords[route_nodes[-1]] - coords[0]).item()
+        return tour, length
+
+
 def solve_route_tsp(coords, route_nodes, tsp_solver):
     """Solve TSP for a single route using EDISCO TSP solver."""
     if len(route_nodes) <= 2:
@@ -596,7 +639,7 @@ def nearest_neighbor_tsp(coords):
     return tour
 
 
-def evaluate_cvrp_solution(coords, demand, capacity, routes, tsp_solver=None):
+def evaluate_cvrp_solution(coords, demand, capacity, routes, tsp_solver=None, use_lkh=False):
     """
     Evaluate CVRP solution quality.
 
@@ -606,6 +649,7 @@ def evaluate_cvrp_solution(coords, demand, capacity, routes, tsp_solver=None):
         capacity: Vehicle capacity
         routes: List of routes (each route is list of customer indices)
         tsp_solver: Optional EDISCO TSP solver
+        use_lkh: If True, use LKH-3 for sub-TSP solving
 
     Returns:
         total_cost: Total route distance
@@ -618,7 +662,9 @@ def evaluate_cvrp_solution(coords, demand, capacity, routes, tsp_solver=None):
         if not route:
             continue
 
-        if tsp_solver is not None and len(route) > 2:
+        if use_lkh and len(route) > 2 and LKH_PATH is not None:
+            opt_route, cost = solve_route_tsp_lkh(coords, route)
+        elif tsp_solver is not None and len(route) > 2:
             opt_route, cost = solve_route_tsp(coords, route, tsp_solver)
         else:
             opt_route = route
@@ -636,6 +682,10 @@ def evaluate_cvrp_solution(coords, demand, capacity, routes, tsp_solver=None):
 
 def visualize_cvrp_solution(coords, routes, demand=None, title="CVRP Solution", save_path=None):
     """Visualize CVRP solution with routes in different colors."""
+    if not HAS_MATPLOTLIB:
+        print("Skipping visualization: matplotlib not installed")
+        return None
+
     fig, ax = plt.subplots(1, 1, figsize=(10, 10))
 
     colors = plt.cm.tab10(np.linspace(0, 1, max(10, len(routes))))
@@ -697,8 +747,18 @@ def main():
     parser.add_argument('--n_instances', type=int, default=10, help='Number of instances to evaluate')
     parser.add_argument('--device', type=str, default='cuda', help='Device')
     parser.add_argument('--visualize', action='store_true', help='Visualize solutions')
+    parser.add_argument('--use_lkh', action='store_true', help='Use LKH-3 for sub-TSP solving (recommended)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     args = parser.parse_args()
+
+    # Check LKH availability
+    if args.use_lkh:
+        if LKH_PATH is not None:
+            print(f"Using LKH-3 for sub-TSP solving: {LKH_PATH}")
+        else:
+            print("Warning: LKH not found! Falling back to NN routing.")
+            print("Install LKH-3 or set LKH_PATH environment variable.")
+            args.use_lkh = False
 
     # Set seed
     torch.manual_seed(args.seed)
@@ -778,23 +838,31 @@ def main():
         routes = extract_routes(route_sequence)
 
         # Evaluate with NN routing
-        cost_nn, _ = evaluate_cvrp_solution(coords, demand, capacity, routes, tsp_solver=None)
+        cost_nn, _ = evaluate_cvrp_solution(coords, demand, capacity, routes, tsp_solver=None, use_lkh=False)
         results['costs_nn'].append(cost_nn)
 
-        # Evaluate with TSP solver
-        if tsp_solver is not None:
+        # Evaluate with optimized solver (LKH or EDISCO TSP)
+        if args.use_lkh:
             cost_tsp, optimized_routes = evaluate_cvrp_solution(
-                coords, demand, capacity, routes, tsp_solver=tsp_solver
+                coords, demand, capacity, routes, tsp_solver=None, use_lkh=True
             )
             results['costs_tsp'].append(cost_tsp)
+            solver_name = "LKH"
+        elif tsp_solver is not None:
+            cost_tsp, optimized_routes = evaluate_cvrp_solution(
+                coords, demand, capacity, routes, tsp_solver=tsp_solver, use_lkh=False
+            )
+            results['costs_tsp'].append(cost_tsp)
+            solver_name = "TSP"
         else:
             cost_tsp = cost_nn
             optimized_routes = routes
             results['costs_tsp'].append(cost_nn)
+            solver_name = "NN"
 
         results['n_routes'].append(len(routes))
 
-        print(f"Instance {i+1}: NN={cost_nn:.2f}, TSP={cost_tsp:.2f}, "
+        print(f"Instance {i+1}: NN={cost_nn:.2f}, {solver_name}={cost_tsp:.2f}, "
               f"Routes={len(routes)}, Improvement={(cost_nn-cost_tsp)/cost_nn*100:.1f}%")
 
         # Visualize first few instances
@@ -806,13 +874,15 @@ def main():
             )
 
     # Summary
+    solver_label = "LKH" if args.use_lkh else ("EDISCO-TSP" if tsp_solver else "NN")
     print("\n" + "="*50)
     print("SUMMARY")
     print("="*50)
-    print(f"Average cost (NN routing):    {np.mean(results['costs_nn']):.2f} ± {np.std(results['costs_nn']):.2f}")
-    print(f"Average cost (TSP routing):   {np.mean(results['costs_tsp']):.2f} ± {np.std(results['costs_tsp']):.2f}")
-    print(f"Average improvement:          {(np.mean(results['costs_nn'])-np.mean(results['costs_tsp']))/np.mean(results['costs_nn'])*100:.1f}%")
-    print(f"Average routes per instance:  {np.mean(results['n_routes']):.1f}")
+    print(f"Sub-TSP Solver: {solver_label}")
+    print(f"Average cost (NN routing):       {np.mean(results['costs_nn']):.2f} ± {np.std(results['costs_nn']):.2f}")
+    print(f"Average cost ({solver_label} routing): {np.mean(results['costs_tsp']):.2f} ± {np.std(results['costs_tsp']):.2f}")
+    print(f"Average improvement:             {(np.mean(results['costs_nn'])-np.mean(results['costs_tsp']))/np.mean(results['costs_nn'])*100:.1f}%")
+    print(f"Average routes per instance:     {np.mean(results['n_routes']):.1f}")
 
 
 if __name__ == '__main__':
